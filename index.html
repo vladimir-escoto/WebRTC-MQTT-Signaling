@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Video Call with MQTT</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; display: flex; }
+        #main { flex: 1; padding: 20px; }
+        #logPanel {
+            width: 300px; height: 100vh; overflow-y: auto;
+            border-left: 2px solid #ccc; padding: 10px;
+            background: #f9f9f9;
+        }
+        video { width: 45%; margin: 5px; border: 2px solid black; }
+    </style>
+</head>
+<body>
+    <div id="main">
+        <h2>WebRTC Video Call with MQTT</h2>
+        <label for="clientId">Your Client ID (Number): </label>
+        <input type="number" id="clientId" min="0" required>
+        <br>
+        <label for="targetId">Target Client ID (Number): </label>
+        <input type="number" id="targetId" min="0" required>
+        <br><br>
+        <button id="connect">Connect</button>
+        <button id="start" disabled>Start Call</button>
+        <p id="status">Waiting...</p>
+        <video id="localVideo" autoplay playsinline></video>
+        <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+    <div id="logPanel">
+        <h3>Connection Log</h3>
+        <ul id="logList"></ul>
+    </div>
+
+    <script>
+        let clientId, targetId;
+        let mqttClient;
+        let topicSignal, topicReceive;
+        let peerConnection;
+        let localStream;
+
+        function logMessage(message) {
+            const logList = document.getElementById("logList");
+            const item = document.createElement("li");
+            item.textContent = message;
+            logList.appendChild(item);
+            console.log(message);
+        }
+
+        document.getElementById("connect").addEventListener("click", async () => {
+            clientId = document.getElementById("clientId").value;
+            targetId = document.getElementById("targetId").value;
+            
+            if (!clientId || !targetId || clientId === targetId) {
+                alert("Please enter valid IDs (they must be different).");
+                return;
+            }
+
+            logMessage(`Client ID set to ${clientId}, targeting Client ${targetId}`);
+            await initializeMedia();
+            initializeMQTT();
+            document.getElementById("connect").disabled = true;
+            document.getElementById("start").disabled = false;
+        });
+
+        async function initializeMedia() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                document.getElementById("localVideo").srcObject = localStream;
+                logMessage("Local video stream initialized.");
+            } catch (error) {
+                logMessage("Error accessing media devices: " + error.message);
+            }
+        }
+
+        function initializeMQTT() {
+            const mqttBroker = "wss://broker.hivemq.com:8884/mqtt";
+            topicSignal = `webrtc/signal/client${clientId}`;
+            topicReceive = `webrtc/signal/client${targetId}`;
+
+            mqttClient = mqtt.connect(mqttBroker);
+
+            mqttClient.on("connect", () => {
+                logMessage("Connected to MQTT");
+                mqttClient.subscribe(topicSignal);
+                logMessage(`Subscribed to topic: ${topicSignal}`);
+            });
+
+            mqttClient.on("message", (topic, message) => {
+                const data = JSON.parse(message.toString());
+                logMessage(`Received Signal: ${JSON.stringify(data)}`);
+                receiveSignal(data);
+            });
+        }
+
+        function initializeWebRTC() {
+            peerConnection = new RTCPeerConnection({
+                iceServers: [
+                    { urls: "stun:stun.l.google.com:19302" },
+                    { urls: "<<turn>>", username: "admin", credential: "123456" }
+                ]
+            });
+
+            peerConnection.onicecandidate = event => {
+                if (event.candidate) {
+                    sendSignal({ candidate: event.candidate });
+                    logMessage("Sent ICE Candidate");
+                }
+            };
+
+            peerConnection.oniceconnectionstatechange = () => {
+                document.getElementById("status").innerText = `ICE Status: ${peerConnection.iceConnectionState}`;
+                logMessage(`ICE State: ${peerConnection.iceConnectionState}`);
+            };
+
+            peerConnection.ontrack = event => {
+                document.getElementById("remoteVideo").srcObject = event.streams[0];
+                logMessage("Remote video stream received.");
+            };
+
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+        }
+
+        document.getElementById("start").addEventListener("click", async () => {
+            initializeWebRTC();
+            logMessage("Starting call...");
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            sendSignal({ offer });
+            logMessage("Offer sent");
+        });
+
+        function sendSignal(message) {
+            if (mqttClient) {
+                mqttClient.publish(topicReceive, JSON.stringify(message));
+                logMessage(`Sent Signal to ${topicReceive}: ${JSON.stringify(message)}`);
+            }
+        }
+
+        async function receiveSignal(data) {
+            if (!peerConnection) {
+                initializeWebRTC();
+            }
+
+            if (data.offer) {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                sendSignal({ answer });
+                logMessage("Answer sent");
+            } else if (data.answer) {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                logMessage("Received Answer");
+            } else if (data.candidate) {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                logMessage("Received ICE Candidate");
+            }
+        }
+    </script>
+</body>
+</html>
